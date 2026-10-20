@@ -20,6 +20,8 @@ const listfile = require('../casc/listfile');
 const realmlist = require('../casc/realmlist');
 const { wmv_parse } = require('../wmv');
 const { wowhead_parse } = require('../wowhead');
+const { parseArmoryEquipment } = require('../armory-equipment');
+const { extractProfileState, mergeVisibleGear } = require('../armory-profile');
 const InstallType = require('../install-type');
 const charTextureOverlay = require('../ui/char-texture-overlay');
 const PNGWriter = require('../png-writer');
@@ -104,6 +106,7 @@ let gl_context = null;
 
 let active_renderer;
 let active_model;
+let character_tab_ready = false;
 
 // external customization models (file_data_id -> { renderer, geosets })
 // e.g. demon hunter horns, dracthyr, mechagnome limb upgrades
@@ -254,6 +257,8 @@ const THUMBNAIL_PRESETS = {
 };
 
 function reset_module_state() {
+	character_tab_ready = false;
+	gl_context = null;
 	active_skins.clear();
 	dispose_skinned_models();
 	clear_materials();
@@ -1165,6 +1170,27 @@ function randomize_customization(core) {
 //endregion
 
 //region import
+async function enrich_armory_appearance(appearance, region, realm, name) {
+	const locale = { us: 'en-us', eu: 'en-gb', kr: 'ko-kr', tw: 'zh-tw' }[region];
+	if (!locale)
+		return { appearance, armoryPageApplied: false, matchedSlots: 0, changedSlots: 0 };
+	const url = `https://worldofwarcraft.blizzard.com/${locale}/character/${region}/${encodeURIComponent(realm)}/${encodeURIComponent(name)}`;
+	try {
+		const response = await generics.get(url);
+		if (!response.ok)
+			throw new Error(`HTTP ${response.status}`);
+		const profile = extractProfileState(await response.text());
+		if (profile.character?.slug?.toLowerCase() !== name.toLowerCase() || profile.character?.realm?.slug?.toLowerCase() !== realm.toLowerCase())
+			throw new Error('Armory page resolved to a different character.');
+		const merged = mergeVisibleGear(appearance, profile);
+		log.write('Armory page matched %d visible transmog slots (%d changed)', merged.matchedSlots, merged.changedSlots);
+		return { ...merged, armoryPageApplied: true };
+	} catch (error) {
+		log.write('Could not read embedded Armory appearance; using Character Appearance API data: %s', error.message);
+		return { appearance, armoryPageApplied: false, matchedSlots: 0, changedSlots: 0 };
+	}
+}
+
 async function import_character(core) {
 	core.view.characterImportMode = 'none';
 	core.view.chrModelLoading = true;
@@ -1181,27 +1207,46 @@ async function import_character(core) {
 	}
 
 	const character_label = util.format('%s (%s-%s)', character_name, effective_region, selected_realm.label);
-	const url = util.format(core.view.config.armoryURL, encodeURIComponent(effective_region), encodeURIComponent(selected_realm.value), encodeURIComponent(character_name.toLowerCase()));
-	log.write('Retrieving character data for %s from %s', character_label, url);
-
-	const res = await generics.get(url);
-	if (res.ok) {
-		try {
-			await apply_import_data(core, await res.json(), 'bnet');
-		} catch (e) {
-			log.write('Failed to parse character data: %s', e.message);
-			core.setToast('error', 'Failed to import character ' + character_label, null, -1);
-		}
-	} else {
-		log.write('Failed to retrieve character data: %d %s', res.status, res.statusText);
-
-		if (res.status == 404)
-			core.setToast('error', 'Could not find character ' + character_label, null, -1);
-		else
-			core.setToast('error', 'Failed to import character ' + character_label, null, -1);
+	try {
+		await import_armory_character(core, effective_region, selected_realm.value, character_name);
+	} catch (error) {
+		log.write('Failed to import character %s: %s', character_label, error.message);
+		core.setToast('error', (error.message.includes('(404)') ? 'Could not find character ' : 'Failed to import character ') + character_label, null, -1);
+	} finally {
+		core.view.chrModelLoading = false;
 	}
+}
 
-	core.view.chrModelLoading = false;
+async function import_armory_character(core, region, realm, character_name) {
+	if (!['us', 'eu', 'kr', 'tw', 'classic-us', 'classic-eu', 'classic-kr', 'classic-tw'].includes(region))
+		throw new Error('Invalid region.');
+	if (typeof realm !== 'string' || !/^[\p{L}\p{N}-]{1,80}$/u.test(realm))
+		throw new Error('Invalid realm slug.');
+	if (typeof character_name !== 'string' || !/^[\p{L}\p{N}-]{2,24}$/u.test(character_name))
+		throw new Error('Invalid character name.');
+
+	const url = util.format(core.view.config.armoryURL,
+		encodeURIComponent(region), encodeURIComponent(realm.toLowerCase()), encodeURIComponent(character_name.toLowerCase()));
+	core.view.chrModelLoading = true;
+	try {
+		const response = await generics.get(url);
+		if (!response.ok)
+			throw new Error(`Character appearance lookup failed (${response.status}).`);
+		const enriched = await enrich_armory_appearance(await response.json(), region, realm, character_name);
+		await apply_import_data(core, enriched.appearance, 'bnet');
+		if (!active_model || !active_renderer?.m2)
+			throw new Error('Character data loaded, but the model could not be displayed.');
+		return {
+			region, realm, name: character_name, fileDataID: active_model,
+			armoryPageApplied: enriched.armoryPageApplied,
+			transmogSlotsMatched: enriched.matchedSlots,
+			transmogSlotsChanged: enriched.changedSlots,
+			equipment: { ...core.view.chrEquippedItems },
+			appearanceModifiers: { ...core.view.chrEquippedItemSkins }
+		};
+	} finally {
+		core.view.chrModelLoading = false;
+	}
 }
 
 async function import_wmv_character(core) {
@@ -1267,7 +1312,7 @@ async function import_wowhead_character(core) {
  * Mutates the provided objects in-place.
  */
 function expand_shoulder_slots(equipment, equipment_skins) {
-	if (equipment[SHOULDER_SLOT_L] !== undefined) {
+	if (equipment[SHOULDER_SLOT_L] !== undefined && equipment[SHOULDER_SLOT_R] === undefined) {
 		equipment[SHOULDER_SLOT_R] = equipment[SHOULDER_SLOT_L];
 
 		if (equipment_skins[SHOULDER_SLOT_L] !== undefined)
@@ -1320,16 +1365,9 @@ async function apply_import_data(core, data, source) {
 				customizations.push({ optionID: customization_entry.option.id, choiceID: customization_entry.choice.id });
 		}
 
-		equipment = {};
-		if (data.items && Array.isArray(data.items)) {
-			for (const item of data.items) {
-				const slot_id = item.internal_slot_id + 1;
-				equipment[slot_id] = item.id;
-
-				if (item.item_appearance_modifier_id)
-					equipment_skins[slot_id] = item.item_appearance_modifier_id;
-			}
-		}
+		const armory_equipment = parseArmoryEquipment(data.items);
+		equipment = armory_equipment.equipment;
+		equipment_skins = armory_equipment.appearanceModifiers;
 
 		if (data.guild_crest) {
 			const crest = data.guild_crest;
@@ -1428,6 +1466,12 @@ async function apply_import_data(core, data, source) {
 		await update_model_selection(core);
 	} finally {
 		is_importing = false;
+	}
+	core.view.chrModelLoading = true;
+	try {
+		await refresh_character_appearance(core);
+	} finally {
+		core.view.chrModelLoading = false;
 	}
 }
 
@@ -1921,9 +1965,9 @@ function update_chr_race_list(core) {
 //endregion
 
 //region export
-const export_char_model = async (core) => {
+const export_char_model = async (core, format_override = null) => {
 	const export_paths = core.openLastExportStream();
-	const format = core.view.config.exportCharacterFormat;
+	const format = format_override ?? core.view.config.exportCharacterFormat;
 
 	if (format === 'PNG' || format === 'CLIPBOARD') {
 		if (active_model) {
@@ -1970,6 +2014,8 @@ const export_char_model = async (core) => {
 
 	const file_data_id = active_model;
 	const file_name = listfile.getByID(file_data_id);
+	let output_path;
+	let error;
 
 	try {
 		if (format === 'OBJ' || format === 'STL') {
@@ -1982,6 +2028,7 @@ const export_char_model = async (core) => {
 			const ext = format === 'STL' ? '.stl' : '.obj';
 			const mark_file_name = ExportHelper.replaceExtension(file_name, ext);
 			const export_path = ExportHelper.getExportPath(mark_file_name);
+			output_path = export_path;
 
 			const casc = core.view.casc;
 			const data = await casc.getFile(file_data_id);
@@ -2047,8 +2094,9 @@ const export_char_model = async (core) => {
 		} else {
 			const casc = core.view.casc;
 			const data = await casc.getFile(file_data_id);
-			const mark_file_name = ExportHelper.replaceExtension(file_name, '.gltf');
+			const mark_file_name = ExportHelper.replaceExtension(file_name, format === 'GLB' ? '.glb' : '.gltf');
 			const export_path = ExportHelper.getExportPath(mark_file_name);
+			output_path = export_path;
 			const exporter = new M2Exporter(data, [], file_data_id);
 
 			for (const [chr_model_texture_target, chr_material] of chr_materials)
@@ -2102,11 +2150,13 @@ const export_char_model = async (core) => {
 			helper.mark(mark_file_name, true);
 		}
 	} catch (e) {
+		error = e.message;
 		helper.mark(file_name, false, e.message, e.stack);
 	}
 
 	helper.finish();
 	export_paths?.close();
+	return { fileDataID: file_data_id, file: helper.succeeded === 1 ? output_path : null, error, succeeded: helper.succeeded === 1 };
 };
 
 const export_chr_texture = async (core) => {
@@ -2195,6 +2245,10 @@ function get_selected_choice(core, option_id) {
 //region template
 module.exports = {
 	get_default_characters_dir,
+	exportCurrentCharacter: (core, format) => export_char_model(core, format),
+	hasCurrentCharacter: () => Boolean(active_model && active_renderer?.m2),
+	isReadyForImport: core => Boolean(character_tab_ready && core.view.chrCustRaces?.length && gl_context),
+	importArmoryCharacter: (core, region, realm, name) => import_armory_character(core, region, realm, name),
 
 	register() {
 		this.registerNavButton('Characters', 'person-solid.svg', InstallType.CASC);
@@ -3057,6 +3111,7 @@ module.exports = {
 		};
 
 		charTextureOverlay.ensureActiveLayerAttached();
+		character_tab_ready = true;
 	},
 
 	unmounted() {

@@ -184,9 +184,9 @@ const get_variant_texture_ids = (file_name) => {
 	}
 };
 
-const export_files = async (core, files, is_local = false, export_id = -1) => {
+const export_files = async (core, files, is_local = false, export_id = -1, format_override = null) => {
 	const export_paths = core.openLastExportStream();
-	const format = core.view.config.exportModelFormat;
+	const format = format_override ?? core.view.config.exportModelFormat;
 
 	const manifest = { type: 'MODELS', exportID: export_id, succeeded: [], failed: [] };
 
@@ -275,15 +275,17 @@ const export_files = async (core, files, is_local = false, export_id = -1) => {
 			manifest.succeeded.push({ fileDataID: file_data_id, files: file_manifest });
 		} catch (e) {
 			helper.mark(file_name, false, e.message, e.stack);
-			manifest.failed.push({ fileDataID: file_data_id });
+			manifest.failed.push({ fileDataID: file_data_id, error: e.message });
 		}
 	}
 
 	helper.finish();
 	export_paths?.close();
+	return manifest;
 };
 
 module.exports = {
+	exportFiles: (core, files, format) => export_files(core, files, false, -1, format),
 	register() {
 		this.registerNavButton('Models', 'cube.svg', InstallType.CASC);
 	},

@@ -862,29 +862,36 @@ const getByFilename = (filename) => {
 /**
 * Returns an array of listfile entries filtered by the given search term.
 * @param {string|RegExp} search
+* @param {number} [limit] Maximum number of results.
+* @param {function} [accept] Optional filename filter.
 * @returns {Array.<object>}
 */
-const getFilteredEntries = (search) => {
+const getFilteredEntries = (search, limit = Infinity, accept = null) => {
 	const results = [];
 	const isRegExp = search instanceof RegExp;
+	const add_match = (fileDataID, fileName) => {
+		if ((isRegExp ? fileName.match(search) : fileName.includes(search)) && (!accept || accept(fileName)))
+			results.push({ fileDataID, fileName });
+		return results.length >= limit;
+	};
 
 	if (is_binary_mode) {
 		for (const [fileDataID, offset] of binary_id_to_offset.entries()) {
 			const pf_index = binary_id_to_pf_index.get(fileDataID);
 			const fileName = binary_read_string_at_offset(pf_index, offset);
-			if (isRegExp ? fileName.match(search) : fileName.includes(search))
-				results.push({ fileDataID, fileName });
+			if (add_match(fileDataID, fileName))
+				break;
 		}
 
 		// include runtime additions from legacy lookups
 		for (const [fileDataID, fileName] of legacy_id_lookup.entries()) {
-			if (isRegExp ? fileName.match(search) : fileName.includes(search))
-				results.push({ fileDataID, fileName });
+			if (results.length >= limit || add_match(fileDataID, fileName))
+				break;
 		}
 	} else {
 		for (const [fileDataID, fileName] of legacy_id_lookup.entries()) {
-			if (isRegExp ? fileName.match(search) : fileName.includes(search))
-				results.push({ fileDataID, fileName });
+			if (add_match(fileDataID, fileName))
+				break;
 		}
 	}
 

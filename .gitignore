@@ -1,5 +1,6 @@
 # nodejs modules
 /node_modules
+/mcp/node_modules
 
 # Output directory for builds.
 /bin

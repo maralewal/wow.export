@@ -96,6 +96,7 @@ const ExternalLinks = require('./js/external-links');
 const textureRibbon = require('./js/ui/texture-ribbon');
 const Shaders = require('./js/3D/Shaders');
 const gpuInfo = require('./js/gpu-info');
+const { startBridge } = require('./js/mcp-bridge');
 
 const Vue = require('vue/dist/vue.cjs.js');
 window.Vue = Vue;
@@ -575,6 +576,47 @@ document.addEventListener('click', function(e) {
 
 	// Load configuration.
 	await config.load();
+	if (nw.App.argv.includes('--enable-mcp')) {
+		try {
+			const modelTab = require('./js/modules/tab_models');
+			const characterTab = require('./js/modules/tab_characters');
+			const textureExporter = require('./js/ui/texture-exporter');
+			const bridge = await startBridge({
+				dataPath: constants.DATA_PATH,
+				isReady: () => Boolean(core.view.casc),
+				isBusy: () => Boolean(core.view.isBusy || core.view.chrModelLoading),
+				search: (query, type, limit) => {
+					if (!listfile.isLoaded())
+						throw new Error('The listfile is still loading.');
+					const extensions = type === 'model' ? ['.m2', '.wmo', '.m3'] : type === 'texture' ? ['.blp'] : null;
+					return listfile.getFilteredEntries(query, limit, name => !extensions || extensions.some(ext => name.endsWith(ext)));
+				},
+				exportModel: (fileDataID, format) => modelTab.exportFiles(core, [fileDataID], format),
+				convertTexture: (fileDataID, format) => textureExporter.exportFiles([fileDataID], false, -1, false, format),
+				exportCurrentCharacter: format => {
+					if (!characterTab.hasCurrentCharacter())
+						throw new Error('Load a character in the Characters tab first.');
+					return characterTab.exportCurrentCharacter(core, format);
+				},
+				importArmoryCharacter: async (region, realm, name) => {
+					if (core.view.activeModule?.__name !== 'tab_characters') {
+						modules.set_active('tab_characters');
+						await Vue.nextTick();
+					}
+					for (let attempt = 0; attempt < 240; attempt++) {
+						if (characterTab.isReadyForImport(core) && !core.view.isBusy && !core.view.chrModelLoading)
+							return characterTab.importArmoryCharacter(core, region, realm, name);
+						await new Promise(resolve => setTimeout(resolve, 500));
+					}
+					throw new Error('Characters tab did not become ready for import.');
+				}
+			});
+			process.once('exit', () => bridge.close());
+			log.write('MCP bridge listening on 127.0.0.1:%d', bridge.port);
+		} catch (error) {
+			log.write('Failed to start MCP bridge: %s', error.message);
+		}
+	}
 
 	// Set-up default export directory if none configured.
 	if (core.view.config.exportDirectory === '') {

@@ -65,8 +65,8 @@ const exportBLPMetadata = async (blp, exportPath, overwriteFiles, manifest, file
  * @param {number} exportID - Export ID for tracking
  * @param {boolean} isMPQ - Whether files are from MPQ archives
  */
-const exportFiles = async (files, isLocal = false, exportID = -1, isMPQ = false) => {
-	const format = core.view.config.exportTextureFormat;
+const exportFiles = async (files, isLocal = false, exportID = -1, isMPQ = false, formatOverride = null) => {
+	const format = formatOverride ?? core.view.config.exportTextureFormat;
 
 	if (format === 'CLIPBOARD') {
 		const { fileName, fileDataID } = getFileInfoPair(files[0]);
@@ -175,13 +175,14 @@ const exportFiles = async (files, isLocal = false, exportID = -1, isMPQ = false)
 			manifest.succeeded.push({ type: format, fileDataID, file: exportPath });
 		} catch (e) {
 			helper.mark(markFileName, false, e.message, e.stack);
-			manifest.failed.push({ type: format, fileDataID });
+			manifest.failed.push({ type: format, fileDataID, error: e.message });
 		}
 	}
 
 	exportPaths?.close();
 
 	helper.finish();
+	return manifest;
 };
 
 /**
