@@ -25,6 +25,13 @@ const WMOShaderMapper = require('../WMOShaderMapper');
 
 const doodadCache = new Set();
 
+// Textures already fetched, decoded and written during the current export.
+// A large WMO (or a map of many WMOs) references the same textures repeatedly;
+// without this each reference re-fetches and re-decodes the BLP. Cleared by
+// clearCache() at the end of an export, alongside doodadCache.
+const textureExportCache = new Set();
+const textureAlphaCache = new Map();
+
 class WMOExporter {
 	/**
 	 * Construct a new WMOExporter instance.
@@ -164,20 +171,34 @@ class WMOExporter {
 					}
 
 					const file_existed = await generics.fileExists(texPath);
-					let has_alpha = true;
+					let has_alpha = textureAlphaCache.get(fileDataID) ?? true;
+
+					// A texture referenced by many materials (or shared across the
+					// WMOs of a map) otherwise gets fetched and decoded once per
+					// reference. Decoding it once per export is enough - a large
+					// raid can reference the same handful of textures thousands of
+					// times, and the fetch+BLP decode dominates the export time.
+					// Keyed on the destination too: with shared textures disabled
+					// the same fileDataID legitimately lands in several folders,
+					// and skipping those writes would leave dangling MTL entries.
+					const texture_cache_key = fileDataID + '>' + texPath;
+					const already_written = textureExportCache.has(texture_cache_key);
 
 					if (glbMode && !raw) {
 						// glb mode: convert to PNG buffer without writing
-						const data = await casc.getFile(fileDataID);
-						const blp = new BLPFile(data);
-						has_alpha = blp.alphaDepth > 0;
-						const png_buffer = blp.toPNG(useAlpha ? 0b1111 : 0b0111);
-						texture_buffers.set(fileDataID, png_buffer);
-						log.write('Buffering WMO texture %d for GLB embedding', fileDataID);
+						if (!texture_buffers.has(fileDataID)) {
+							const data = await casc.getFile(fileDataID);
+							const blp = new BLPFile(data);
+							has_alpha = blp.alphaDepth > 0;
+							textureAlphaCache.set(fileDataID, has_alpha);
+							const png_buffer = blp.toPNG(useAlpha ? 0b1111 : 0b0111);
+							texture_buffers.set(fileDataID, png_buffer);
+							log.write('Buffering WMO texture %d for GLB embedding', fileDataID);
 
-						if (!file_existed)
-							files_to_cleanup.push(texPath);
-					} else if (config.overwriteFiles || !file_existed) {
+							if (!file_existed)
+								files_to_cleanup.push(texPath);
+						}
+					} else if (!already_written && (config.overwriteFiles || !file_existed)) {
 						const data = await casc.getFile(fileDataID);
 
 						log.write('Exporting WMO texture %d -> %s', fileDataID, texPath);
@@ -186,10 +207,12 @@ class WMOExporter {
 						} else {
 							const blp = new BLPFile(data);
 							has_alpha = blp.alphaDepth > 0;
+							textureAlphaCache.set(fileDataID, has_alpha);
 							await blp.saveToPNG(texPath, useAlpha ? 0b1111 : 0b0111);
 						}
+						textureExportCache.add(texture_cache_key);
 					} else {
-						log.write('Skipping WMO texture export %s (file exists, overwrite disabled)', texPath);
+						log.write('Skipping WMO texture export %s (already exported this run or exists)', texPath);
 					}
 
 					if (usePosix)
@@ -1388,6 +1411,8 @@ class WMOExporter {
 	 */
 	static clearCache() {
 		doodadCache.clear();
+		textureExportCache.clear();
+		textureAlphaCache.clear();
 	}
 }
 
